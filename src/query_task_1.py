@@ -1,92 +1,105 @@
+from typing import Dict
 import os
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, count, when, min as spark_min, broadcast, lit
-from pyspark.sql.window import Window
+from dotenv import load_dotenv
+from pyspark.sql import SparkSession, DataFrame
+from logger_config import setup_logger
 
-def get_spark_session():
-    """Initialize and return a SparkSession with JDBC config."""
-    return SparkSession.builder \
-        .appName("Bets Query") \
-        .config("spark.jars", os.getenv("JDBC_DRIVER_PATH", "/opt/bitnami/spark/postgresql-42.5.0.jar")) \
-        .config("spark.sql.autoBroadcastJoinThreshold", "-1") \
-        .config("spark.ui.enabled", "true") \
-        .getOrCreate()
+logger = setup_logger('query_task_1', 'query_task_1.log')
 
-def load_data_from_postgres(spark):
-    """Load bets and events data from PostgreSQL into Spark DataFrames."""
-    db_url = f"jdbc:postgresql://{os.getenv('DB_HOST', 'postgres_db')}:{os.getenv('DB_PORT', '5432')}/{os.getenv('DB_NAME', 'betsdb')}"
-    db_properties = {
-        "user": os.getenv("DB_USER", "user"),
-        "password": os.getenv("DB_PASSWORD", "password"),
-        "driver": "org.postgresql.Driver"
+def load_env_variables() -> Dict[str, str]:
+    """Load environment variables from .env file."""
+    load_dotenv()
+    return {
+        "db_host": os.getenv("DB_HOST"),
+        "db_port": os.getenv("DB_PORT"),
+        "db_name": os.getenv("DB_NAME"),
+        "db_user": os.getenv("DB_USER"),
+        "db_password": os.getenv("DB_PASSWORD"),
+        "jdbc_driver_path": os.getenv("JDBC_DRIVER_PATH"),
+        "sql_task_1_path": os.getenv("SQL_TASK_1_FILE_PATH")
     }
 
-    bets_df = spark.read.jdbc(url=db_url, table="bets", properties=db_properties)
-    events_df = spark.read.jdbc(url=db_url, table="events", properties=db_properties)
+def create_spark_session(jdbc_driver_path: str) -> SparkSession:
+    """Create SparkSession with PostgreSQL JDBC driver."""
+    try:
+        spark = SparkSession.builder \
+            .appName("Query Task 1") \
+            .config("spark.jars", jdbc_driver_path) \
+            .config("spark.driver.extraClassPath", jdbc_driver_path) \
+            .config("spark.executor.extraClassPath", jdbc_driver_path) \
+            .getOrCreate()
+        logger.info("SparkSession created successfully.")
+        return spark
+    except Exception as e:
+        logger.error(f"Error creating SparkSession: {e}")
+        raise
 
-    return bets_df, events_df
+def load_table(spark: SparkSession, table_name: str, db_config: Dict[str, str]) -> DataFrame:
+    """Load table from PostgreSQL as Spark DataFrame."""
+    jdbc_url = f"jdbc:postgresql://{db_config['db_host']}:{db_config['db_port']}/{db_config['db_name']}"
+    return spark.read \
+        .format("jdbc") \
+        .option("url", jdbc_url) \
+        .option("dbtable", table_name) \
+        .option("user", db_config["db_user"]) \
+        .option("password", db_config["db_password"]) \
+        .option("driver", "org.postgresql.Driver") \
+        .load()
 
-def run_query_with_pyspark(spark):
-    """Run the filtering and aggregation logic with PySpark based on task conditions."""
-    bets_df, events_df = load_data_from_postgres(spark)
-
-    events_df = broadcast(events_df)  # Improve join performance
-
-    join_df = bets_df.join(events_df, "event_id", "inner").cache()
-
-    filtered_df = join_df.filter(
-        (col("create_time") >= "2022-03-14 12:00:00") &
-        (col("event_stage") == "Prematch") &
-        (col("amount") >= 10) &
-        (col("settlement_time") <= "2022-03-15 12:00:00") &
-        (col("bet_type") != "System") &
-        (~col("result").isin("Cashout", "Return", "TechnicalReturn")) &
-        (col("is_free_bet") == False)
+def run_query_with_pyspark(bets_df: DataFrame, events_df: DataFrame) -> None:
+    """Perform the filtering and aggregation logic using PySpark."""
+    filtered_bets = bets_df.filter(
+        (bets_df.create_time >= '2022-03-14 12:00:00') &
+        (bets_df.event_stage == 'Prematch') &
+        (bets_df.amount >= 10) &
+        (bets_df.settlement_time <= '2022-03-15 12:00:00') &
+        (bets_df.bet_type != 'System') &
+        (~bets_df.result.isin('Cashout', 'Return', 'TechnicalReturn')) &
+        (bets_df.is_free_bet == False)
     )
 
-    # Aggregate by bet_id and player_id
-    aggregated_df = filtered_df.groupBy("bet_id", "player_id").agg(
-        count("*").alias("total_events"),
+    joined = filtered_bets.join(events_df, on="event_id")
+
+    from pyspark.sql.functions import col, count, when, min as spark_min
+    agg = joined.groupBy("bet_id", "player_id").agg(
+        count("event_id").alias("total_events"),
         count(when(col("sport") == "E-Sports", True)).alias("esports_events"),
         spark_min("accepted_odd").alias("min_odd")
     )
 
-    # Filter bets that are fully E-Sports and have all odds >= 1.5
-    result_df = aggregated_df.filter(
+    result = agg.filter(
         (col("total_events") == col("esports_events")) &
         (col("min_odd") >= 1.5)
     ).select("player_id").distinct()
 
-    result_df.explain(True)
-    result_df.show(truncate=False, vertical=True)
-    return result_df
+    logger.info("Players matching criteria:")
+    result.show(truncate=False)
 
-def run_sql_file_query(spark):
-    """Execute the same logic as SQL script if defined in external file."""
-    sql_file_path = os.getenv("SQL_FIRST_TASK_PATH", "/mnt/sql/query_task_1.sql")
-
+def run_sql_file_query(spark: SparkSession, sql_path: str) -> None:
+    """Run the query from SQL file using Spark SQL."""
     try:
-        with open(sql_file_path, "r", encoding="utf-8") as file:
-            sql_query = file.read()
+        with open(sql_path, 'r', encoding='utf-8') as f:
+            sql = f.read()
+        spark.sql("USE bets")  # assuming the database context is needed
+        result = spark.sql(sql)
+        logger.info("Query from SQL file executed successfully:")
+        result.show(truncate=False)
     except Exception as e:
-        raise Exception(f"Unable to read SQL file {sql_file_path}: {e}")
+        logger.error(f"Error executing SQL file: {e}")
+        raise
 
-    bets_df, events_df = load_data_from_postgres(spark)
-    bets_df.createOrReplaceTempView("bets")
-    events_df.createOrReplaceTempView("events")
+def main() -> None:
+    """Main function to run query task 1."""
+    db_config = load_env_variables()
+    spark = create_spark_session(db_config["jdbc_driver_path"])
 
-    result_df = spark.sql(sql_query)
-    return result_df
+    bets_df = load_table(spark, "bets", db_config)
+    events_df = load_table(spark, "events", db_config)
 
-if __name__ == "__main__":
-    spark = get_spark_session()
-
-    # Run query via PySpark API
-    result_df = run_query_with_pyspark(spark)
-    result_df.show()
-
-    # Optionally, run the same query via external SQL file
-    sql_result_df = run_sql_file_query(spark)
-    sql_result_df.show()
+    run_query_with_pyspark(bets_df, events_df)
+    run_sql_file_query(spark, db_config["sql_task_1_path"])
 
     spark.stop()
+
+if __name__ == "__main__":
+    main()

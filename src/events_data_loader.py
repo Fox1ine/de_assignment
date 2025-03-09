@@ -1,15 +1,15 @@
+from typing import Dict, Set
 import os
 from dotenv import load_dotenv
-import psycopg2
-from pyspark.sql import SparkSession
+from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql.functions import monotonically_increasing_id, col
+from data_utils import connect_to_postgres, create_schema, create_spark_session, get_db_columns
 from logger_config import setup_logger
 
 logger = setup_logger('events_loader', 'events_loader.log')
 
-
-def load_env_variables():
-    """Load environment variables from the .env file."""
+def load_env_variables() -> Dict[str, str]:
+    """Load environment variables from .env file."""
     load_dotenv()
     return {
         "db_host": os.getenv("DB_HOST"),
@@ -23,134 +23,54 @@ def load_env_variables():
         "jdbc_driver_path": os.getenv("JDBC_DRIVER_PATH")
     }
 
+def read_events_csv(spark: SparkSession, csv_path: str) -> DataFrame:
+    """Read events CSV file into a Spark DataFrame. Add unique row_id if not present."""
+    df = spark.read.option("header", "true").option("inferSchema", "true").csv(csv_path)
+    if "row_id" not in df.columns:
+        df = df.withColumn("row_id", monotonically_increasing_id())
+    return df
 
-def connect_to_postgres(db_config):
-    """Establish a connection to the PostgreSQL database."""
-    try:
-        conn = psycopg2.connect(
-            host=db_config["db_host"],
-            port=db_config["db_port"],
-            dbname=db_config["db_name"],
-            user=db_config["db_user"],
-            password=db_config["db_password"]
-        )
-        logger.info("Connected to PostgreSQL successfully.")
-        return conn
-    except Exception as e:
-        logger.error(f"Error connecting to PostgreSQL: {e}")
-        raise
+def prepare_dataframe(df: DataFrame, db_columns: Set[str]) -> DataFrame:
+    """Drop temporary row_id if necessary, select valid DB columns, and repartition for parallelism."""
+    if "id" in db_columns and "row_id" in df.columns:
+        df = df.drop("row_id")
+    return df.select([col(c) for c in db_columns if c in df.columns]).repartition(10)
 
+def write_dataframe_to_db(df: DataFrame, db_config: Dict[str, str], table: str) -> None:
+    """Write Spark DataFrame to PostgreSQL using JDBC."""
+    df.write.format("jdbc") \
+        .option("url", f"jdbc:postgresql://{db_config['db_host']}:{db_config['db_port']}/{db_config['db_name']}") \
+        .option("dbtable", table) \
+        .option("user", db_config["db_user"]) \
+        .option("password", db_config["db_password"]) \
+        .option("driver", "org.postgresql.Driver") \
+        .option("batchsize", 10000) \
+        .mode("append") \
+        .save()
+    logger.info(f"Data successfully written to '{table}' table.")
 
-def create_schema(conn, sql_file_path):
-    """Execute an SQL script to create the database schema."""
-    with open(sql_file_path, 'r', encoding='utf-8') as f:
-        sql_script = f.read()
-    with conn.cursor() as cur:
-        cur.execute(sql_script)
-    conn.commit()
-    logger.info(f"Schema created successfully using {sql_file_path}.")
+def load_events_data() -> None:
+    """Main function that coordinates reading, transforming, and writing events data."""
+    config = load_env_variables()
 
+    # Create schema before loading data
+    with connect_to_postgres(config) as conn:
+        create_schema(conn, config["sql_events_file_path"], name="events")
 
-def create_spark_session(jdbc_driver_path):
-    """Initialize a SparkSession for processing event data."""
-    try:
-        spark = SparkSession.builder \
-            .appName("Load Events to PostgreSQL") \
-            .config("spark.jars", jdbc_driver_path) \
-            .config("spark.driver.extraClassPath", jdbc_driver_path) \
-            .config("spark.executor.extraClassPath", jdbc_driver_path) \
-            .getOrCreate()
-        logger.info("SparkSession created successfully.")
-        return spark
-    except Exception as e:
-        logger.error(f"Error creating SparkSession: {e}")
-        raise
+    spark = create_spark_session(config["jdbc_driver_path"])
+    df = read_events_csv(spark, config["csv_path"])
 
+    # Get expected column names from DB
+    with connect_to_postgres(config) as conn:
+        columns = get_db_columns(conn, "events")
 
-def read_events_csv(spark, csv_path):
-    """Read and process event data from a CSV file."""
-    try:
-        events_df = spark.read \
-            .option("header", "true") \
-            .option("inferSchema", "true") \
-            .csv(csv_path)
-        logger.info("CSV file read successfully.")
-
-        # Ensure unique row identification if missing
-        if "row_id" not in events_df.columns:
-            events_df = events_df.withColumn("row_id", monotonically_increasing_id())
-
-        return events_df
-    except Exception as e:
-        logger.error(f"Error reading CSV file: {e}")
-        raise
-
-
-def get_db_columns(conn, table_name='events'):
-    """Retrieve column names from the PostgreSQL table."""
-    with conn.cursor() as cur:
-        cur.execute(f"SELECT column_name FROM information_schema.columns WHERE table_name = '{table_name}';")
-        db_columns = {row[0] for row in cur.fetchall()}
-    return db_columns
-
-
-def prepare_dataframe(events_df, db_columns):
-    """Select only required columns and optimize DataFrame partitions."""
-    if "id" in db_columns and "row_id" in events_df.columns:
-        events_df = events_df.drop("row_id")
-    events_df = events_df.select([col(c) for c in db_columns if c in events_df.columns])
-    events_df = events_df.repartition(10)  # Improve parallel processing
-    logger.info(f"Final DataFrame schema: {events_df.schema}")
-    return events_df
-
-
-def write_dataframe_to_db(events_df, db_config):
-    """Write the processed DataFrame to the PostgreSQL database."""
-    postgres_url = f"jdbc:postgresql://{db_config['db_host']}:{db_config['db_port']}/{db_config['db_name']}"
-    postgres_properties = {
-        "user": db_config["db_user"],
-        "password": db_config["db_password"],
-        "driver": "org.postgresql.Driver"
-    }
-    try:
-        events_df.write \
-            .format("jdbc") \
-            .option("url", postgres_url) \
-            .option("dbtable", "events") \
-            .option("user", postgres_properties["user"]) \
-            .option("password", postgres_properties["password"]) \
-            .option("driver", postgres_properties["driver"]) \
-            .option("batchsize", 10000) \
-            .mode("append") \
-            .save()
-        logger.info("Data successfully written to 'events' table.")
-    except Exception as e:
-        logger.error(f"Error writing data to PostgreSQL: {e}")
-        raise
-
-
-def load_events_data():
-    """Main function to orchestrate event data processing."""
-    db_config = load_env_variables()
-
-    with connect_to_postgres(db_config) as conn:
-        create_schema(conn, db_config["sql_events_file_path"])
-
-    spark = create_spark_session(db_config["jdbc_driver_path"])
-    events_df = read_events_csv(spark, db_config["csv_path"])
-
-    with connect_to_postgres(db_config) as conn:
-        db_columns = get_db_columns(conn)
-
-    events_df = prepare_dataframe(events_df, db_columns)
-    write_dataframe_to_db(events_df, db_config)
-
+    df = prepare_dataframe(df, columns)
+    write_dataframe_to_db(df, config, "events")
     spark.stop()
 
-    with connect_to_postgres(db_config) as conn:
-        create_schema(conn, db_config["sql_events_indexes_path"])
-    logger.info("Events data load process completed successfully.")
-
+    # Create indexes after loading
+    with connect_to_postgres(config) as conn:
+        create_schema(conn, config["sql_events_indexes_path"], name="events indexes")
 
 if __name__ == "__main__":
     load_events_data()
