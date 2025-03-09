@@ -180,6 +180,22 @@ I noticed performance improvements after doing this - especially when indexing, 
 In the next step, I grouped the data by bet_id and player_id to calculate how many total events were in each bet, how many of them were esports, and to take the minimum accepted_odd. I used COUNT(CASE WHEN...) instead of the window function because I only needed group-level statistics and it was cleaner that way. 
 The last step was just sampling individual player_id, since the goal was to get a set of users matching all the criteria -- one row per player, no more. I added comments like -- Guess unic player_id to keep things a bit fun, but at the same time self-documenting. In general, I moved to a more layered approach because the logic was easier to debug, easier to maintain, and noticeably faster in practice.
 
+#### A few words about queries:
+I created two different SQL query versions for Task 1.
+You can find them in:
+- ```first_version_query_task1.sql``` — my initial implementation
+- ```query_task_1.sql``` — the final version using a different approach
+
+After writing the first version, I ran EXPLAIN ANALYZE and noticed that it took significantly longer to execute than expected, even on a relatively small dataset. This version relied heavily on multiple CTEs, subqueries, and filtering logic that introduced complexity and likely caused performance overhead.
+As a result, I decided to try a more efficient approach using window functions. In the second version, I compute group-level metrics (like minimum odds and count of E-Sports events) directly using PARTITION BY, which significantly reduces complexity and improves performance.
+
+#### ```first_version_query_task1.sql``` EXPLAIN ANALYZE:
+![img.png](img/img333.png)
+#### ```query_task_1.sql``` EXPLAIN ANALYZE:
+![img_1.png](img/img1231.png)
+
+
+
 #### Screenshot of sql query result:
 ![img_4.png](img/img_4.png)
 #### Screenshot of pySpark query result:
