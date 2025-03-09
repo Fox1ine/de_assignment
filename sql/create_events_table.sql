@@ -1,0 +1,9 @@
+DROP TABLE IF EXISTS events CASCADE;
+
+CREATE TABLE events (
+    id SERIAL PRIMARY KEY,
+    event_id VARCHAR(255) NOT NULL,
+    sport VARCHAR(255) NOT NULL,
+    category VARCHAR(255) NOT NULL,
+    event VARCHAR(255) NOT NULL
+);
